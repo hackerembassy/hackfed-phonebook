@@ -79,6 +79,21 @@ Example response:
 
 `GET /health` reports whether a snapshot exists and whether the last refresh failed. It does not call FreePBX.
 
+## Container image
+
+The `Publish Docker image` GitHub Actions workflow builds the Dockerfile and
+pushes to `ghcr.io/hackerembassy/hackfed-phonebook` on pushes to `main` or a
+manual run from the Actions tab.
+
+- Every build publishes an image tag using the GitHub Actions run ID
+  (`github.run_id`). Re-running the same workflow run reuses that tag.
+- Builds from `main` also publish `latest`.
+
+Publishing uses the built-in `GITHUB_TOKEN` with `packages: write`; no additional
+registry secrets are required. GHCR packages are initially private by default.
+Change the package visibility to public in GitHub's package settings if anonymous
+pulls are needed, or authenticate to GHCR before pulling a private image.
+
 ## Test
 
 ```bash
