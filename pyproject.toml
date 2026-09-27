@@ -1,0 +1,16 @@
+[project]
+name = "freepbx-phonebook"
+version = "0.1.0"
+description = "Minimal JSON phonebook backed by the FreePBX API"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+freepbx-phonebook = "app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["app"]
