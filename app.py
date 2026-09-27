@@ -45,36 +45,28 @@ class UpstreamError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     api_url: str
-    api_key: str = field(default="", repr=False)
+    client_id: str
+    client_secret: str = field(repr=False)
     cache_ttl_seconds: int = 60
     request_timeout_seconds: int = 10
     host: str = "0.0.0.0"
     port: int = 8080
     tls_verify: bool = True
-    client_id: str = ""
-    client_secret: str = field(default="", repr=False)
     token_url: str = ""
     scope: str = "gql:core:read"
 
     @classmethod
     def from_env(cls) -> "Config":
         api_url = os.getenv("FREEPBX_API_URL", "").strip()
-        api_key = os.getenv("FREEPBX_API_KEY", "").strip()
         client_id = os.getenv("FREEPBX_CLIENT_ID", "").strip()
         client_secret = os.getenv("FREEPBX_CLIENT_SECRET", "").strip()
         if not api_url:
             raise ConfigurationError("FREEPBX_API_URL is required")
-        if client_id or client_secret:
-            if not client_id or not client_secret:
-                raise ConfigurationError("FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET are both required")
-        elif not api_key:
-            raise ConfigurationError(
-                "FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET (or FREEPBX_API_KEY) are required"
-            )
+        if not client_id or not client_secret:
+            raise ConfigurationError("FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET are both required")
 
         return cls(
             api_url=api_url,
-            api_key=api_key,
             client_id=client_id,
             client_secret=client_secret,
             token_url=os.getenv("FREEPBX_TOKEN_URL", "").strip(),
@@ -181,8 +173,6 @@ class FreePBXClient:
         self._opener = build_opener(HTTPSHandler(context=self._ssl_context), _NoRedirect())
 
     def _authorization(self) -> str:
-        if not self.config.client_id:
-            return self.config.api_key
         with self._token_lock:
             now = time.monotonic()
             if self._access_token and now < self._token_expires_at:

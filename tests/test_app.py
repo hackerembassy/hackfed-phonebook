@@ -21,7 +21,8 @@ class TLSConfigurationTests(unittest.TestCase):
     def config_from_env(self, **overrides):
         with patch.dict(os.environ, {
             "FREEPBX_API_URL": "https://pbx.example.test/admin/api/api/gql",
-            "FREEPBX_API_KEY": "Bearer test-token",
+            "FREEPBX_CLIENT_ID": "test-client",
+            "FREEPBX_CLIENT_SECRET": "test-secret",
             **overrides,
         }, clear=True):
             return Config.from_env()
@@ -44,7 +45,10 @@ class TLSConfigurationTests(unittest.TestCase):
                 config = self.config_from_env(FREEPBX_TLS_VERIFY=str(verify))
                 client = FreePBXClient(config)
                 response = MagicMock()
-                response.read.return_value = json.dumps(graphql_payload([])).encode()
+                response.read.side_effect = [
+                    json.dumps({"access_token": "test-token", "token_type": "Bearer", "expires_in": 3600}).encode(),
+                    json.dumps(graphql_payload([])).encode(),
+                ]
                 open_url.return_value.__enter__.return_value = response
                 self.assertEqual(client.fetch_extensions(), [])
                 context = build.call_args.args[0]._context
@@ -53,7 +57,7 @@ class TLSConfigurationTests(unittest.TestCase):
                 self.assertEqual(open_url.call_args.kwargs["timeout"], config.request_timeout_seconds)
                 request = open_url.call_args.args[0]
                 self.assertEqual(request.full_url, config.api_url)
-                self.assertEqual(request.get_header("Authorization"), config.api_key)
+                self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
                 self.assertEqual(request.method, "POST")
 
     def test_disabled_verification_logs_warning(self):
@@ -99,9 +103,13 @@ class OAuthTests(unittest.TestCase):
             with self.subTest(missing=missing), patch.dict(os.environ, incomplete, clear=True):
                 with self.assertRaises(ConfigurationError):
                     Config.from_env()
-        with patch.dict(os.environ, {"FREEPBX_API_URL": self.config.api_url}, clear=True):
-            with self.assertRaises(ConfigurationError):
-                Config.from_env()
+        for legacy_key in ("", "Bearer legacy-token"):
+            with self.subTest(legacy_key=legacy_key), patch.dict(os.environ, {
+                "FREEPBX_API_URL": self.config.api_url,
+                "FREEPBX_API_KEY": legacy_key,
+            }, clear=True):
+                with self.assertRaisesRegex(ConfigurationError, "FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET"):
+                    Config.from_env()
 
     def test_token_request_reuse_and_early_renewal(self):
         client = FreePBXClient(self.config)
@@ -131,8 +139,8 @@ class OAuthTests(unittest.TestCase):
             self.assertEqual(calls[4].args[0].get_header("Authorization"), "Bearer replacement")
             self.assertEqual(calls[0].kwargs["timeout"], self.config.request_timeout_seconds)
 
-    def test_explicit_url_and_credentials_override_manual_token(self):
-        config = Config(**{**vars(self.config), "token_url": "https://pbx.example.test/oauth/token", "api_key": "Bearer old"})
+    def test_explicit_token_url(self):
+        config = Config(**{**vars(self.config), "token_url": "https://pbx.example.test/oauth/token"})
         client = FreePBXClient(config)
         with patch.object(client._opener, "open", return_value=self.response(self.token())) as open_url:
             self.assertEqual(client._authorization(), "Bearer test-access-token")
@@ -307,6 +315,8 @@ class ApiIntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "FREEPBX_API_URL": f"http://127.0.0.1:{self.upstream.server_port}/admin/api/api/gql",
             "FREEPBX_API_KEY": "Bearer test-access-token",
+            "FREEPBX_CLIENT_ID": "integration-client",
+            "FREEPBX_CLIENT_SECRET": "integration-secret",
             "FREEPBX_API_KEY_HEADER": "X-API-Key",
             "FREEPBX_API_METHOD": "DELETE",
             "FREEPBX_API_BODY": "not JSON",
@@ -314,7 +324,7 @@ class ApiIntegrationTests(unittest.TestCase):
             "HOST": "127.0.0.1",
         }, clear=True):
             config = Config.from_env()
-        for field in ("api_method", "api_body", "extensions_path", "api_key_header"):
+        for field in ("api_key", "api_method", "api_body", "extensions_path", "api_key_header"):
             self.assertFalse(hasattr(config, field))
         # A zero port selects an ephemeral port for the test server.
         config = Config(**{**vars(config), "port": 0})
@@ -337,7 +347,8 @@ class ApiIntegrationTests(unittest.TestCase):
             payload = json.load(response)
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(self.received_authorization, "Bearer test-access-token")
+        self.assertEqual(self.received_authorization, "Bearer integration-token")
+        self.assertEqual(len(self.token_requests), 1)
         self.assertIsNone(self.received_api_key)
         self.assertEqual(self.received_content_type, "application/json")
         self.assertEqual(set(self.received_body), {"query"})
