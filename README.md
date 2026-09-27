@@ -15,6 +15,14 @@ Set these required values in `.env`:
 - `FREEPBX_API_URL`: the GraphQL endpoint, normally `https://<pbx>/admin/api/api/gql`.
 - `FREEPBX_API_KEY`: the full bearer authorization value, `"Bearer <access-token>"`.
 
+`FREEPBX_TLS_VERIFY` defaults to `true`. Set it to `false` to connect to a
+self-signed HTTPS server without certificate or hostname verification. HTTPS
+traffic remains encrypted, but the server's identity is not verified, allowing
+server impersonation. Prefer a trusted certificate for production. This setting
+applies only to the FreePBX client's requests and logs a warning when disabled.
+It does not fix upstream HTTP 500 errors. Recreate the container after changing
+environment variables for the setting to take effect.
+
 The request is fixed: HTTP `POST`, a JSON body containing the query `query { fetchAllExtensions { status message extension { extensionId user { name } } } }`, and the response path `data.fetchAllExtensions.extension`. Method, body, and response path are not configurable; legacy environment overrides are ignored.
 
 The authentication header is hardcoded to `Authorization`; its name is not configurable and legacy header-name overrides are ignored. The service sends `FREEPBX_API_KEY` verbatim as its value, so include the `Bearer ` prefix. Token acquisition and renewal are not implemented; obtain the token separately using a Machine-to-Machine application with the `gql:core:read` scope.

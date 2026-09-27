@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ class Config:
     request_timeout_seconds: int = 10
     host: str = "0.0.0.0"
     port: int = 8080
+    tls_verify: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -64,6 +66,7 @@ class Config:
             request_timeout_seconds=_positive_int("REQUEST_TIMEOUT_SECONDS", 10),
             host=os.getenv("HOST", "0.0.0.0").strip(),
             port=_positive_int("PORT", 8080),
+            tls_verify=json.loads(os.getenv("FREEPBX_TLS_VERIFY", "true").strip().lower()),
         )
 
 
@@ -141,6 +144,14 @@ def normalize_extensions(payload: Any) -> list[dict[str, str]]:
 class FreePBXClient:
     def __init__(self, config: Config):
         self.config = config
+        self._ssl_context = ssl.create_default_context()
+        if not config.tls_verify:
+            self._ssl_context.check_hostname = False
+            self._ssl_context.verify_mode = ssl.CERT_NONE
+            LOGGER.warning(
+                "FreePBX TLS certificate verification is disabled; "
+                "the upstream server identity will not be verified"
+            )
 
     def fetch_extensions(self) -> list[dict[str, str]]:
         headers = {
@@ -157,7 +168,11 @@ class FreePBXClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+            with urlopen(
+                request,
+                timeout=self.config.request_timeout_seconds,
+                context=self._ssl_context,
+            ) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise UpstreamError(f"FreePBX API returned HTTP {error.code}") from error

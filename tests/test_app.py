@@ -1,9 +1,10 @@
 import json
 import os
+import ssl
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.request import urlopen
 
 from app import Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions
@@ -11,6 +12,51 @@ from app import Config, ExtensionCache, FreePBXClient, UpstreamError, create_ser
 
 def graphql_payload(records, status=True):
     return {"data": {"fetchAllExtensions": {"status": status, "extension": records}}}
+
+
+class TLSConfigurationTests(unittest.TestCase):
+    def config_from_env(self, **overrides):
+        with patch.dict(os.environ, {
+            "FREEPBX_API_URL": "https://pbx.example.test/admin/api/api/gql",
+            "FREEPBX_API_KEY": "Bearer test-token",
+            **overrides,
+        }, clear=True):
+            return Config.from_env()
+
+    def test_verification_enabled_by_default(self):
+        self.assertTrue(self.config_from_env().tls_verify)
+
+    def test_boolean_values(self):
+        for raw in ("true", " TRUE "):
+            with self.subTest(raw=raw):
+                self.assertIs(self.config_from_env(FREEPBX_TLS_VERIFY=raw).tls_verify, True)
+        for raw in ("false", " FALSE "):
+            with self.subTest(raw=raw):
+                self.assertIs(self.config_from_env(FREEPBX_TLS_VERIFY=raw).tls_verify, False)
+
+    def test_client_passes_scoped_tls_context(self):
+        for verify in (True, False):
+            with self.subTest(verify=verify), patch("app.urlopen") as open_url:
+                config = self.config_from_env(FREEPBX_TLS_VERIFY=str(verify))
+                client = FreePBXClient(config)
+                response = MagicMock()
+                response.read.return_value = json.dumps(graphql_payload([])).encode()
+                open_url.return_value.__enter__.return_value = response
+                self.assertEqual(client.fetch_extensions(), [])
+                context = open_url.call_args.kwargs["context"]
+                self.assertEqual(context.check_hostname, verify)
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED if verify else ssl.CERT_NONE)
+                self.assertEqual(open_url.call_args.kwargs["timeout"], config.request_timeout_seconds)
+                request = open_url.call_args.args[0]
+                self.assertEqual(request.full_url, config.api_url)
+                self.assertEqual(request.get_header("Authorization"), config.api_key)
+                self.assertEqual(request.method, "POST")
+
+    def test_disabled_verification_logs_warning(self):
+        with self.assertLogs("phonebook", level="WARNING") as logs:
+            FreePBXClient(self.config_from_env(FREEPBX_TLS_VERIFY="false"))
+        self.assertIn("verification is disabled", logs.output[0])
+        self.assertNotIn("test-token", logs.output[0])
 
 
 class NormalizeExtensionsTests(unittest.TestCase):
