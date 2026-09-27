@@ -94,6 +94,24 @@ registry secrets are required. GHCR packages are initially private by default.
 Change the package visibility to public in GitHub's package settings if anonymous
 pulls are needed, or authenticate to GHCR before pulling a private image.
 
+### Host the published image
+
+Use `docker compose -f compose.hosting.yml up -d` to deploy the published
+`ghcr.io/hackerembassy/hackfed-phonebook:latest` image without building locally.
+The hosting file is standalone; do not combine it with `compose.yml`.
+
+Configuration is interpolated from the shell environment or Compose's `.env`
+file, with shell values taking precedence. Set `FREEPBX_API_URL`,
+`FREEPBX_CLIENT_ID`, and `FREEPBX_CLIENT_SECRET`; Compose rejects missing or
+empty values. Optional application settings use the defaults described above.
+
+The published port defaults to `127.0.0.1:8080`. Set `BIND_ADDRESS` to a trusted
+network interface (or `0.0.0.0` for all interfaces) and `PORT` to change the host
+port. The service always listens on `0.0.0.0:8080` inside the container.
+
+Running the deployment command again pulls the latest image and recreates the
+container if needed. Stop it with `docker compose -f compose.hosting.yml down`.
+
 ## Test
 
 ```bash

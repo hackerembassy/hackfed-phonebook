@@ -1,0 +1,18 @@
+services:
+  phonebook:
+    image: ghcr.io/hackerembassy/hackfed-phonebook:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      FREEPBX_API_URL: ${FREEPBX_API_URL}
+      FREEPBX_CLIENT_ID: ${FREEPBX_CLIENT_ID}
+      FREEPBX_CLIENT_SECRET: ${FREEPBX_CLIENT_SECRET}
+      FREEPBX_TLS_VERIFY: "true"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
