@@ -13,7 +13,30 @@ cp .env.example .env
 Set these required values in `.env`:
 
 - `FREEPBX_API_URL`: the GraphQL endpoint, normally `https://<pbx>/admin/api/api/gql`.
-- `FREEPBX_API_KEY`: the full bearer authorization value, `"Bearer <access-token>"`.
+- `FREEPBX_CLIENT_ID`: the Machine-to-Machine application's client ID.
+- `FREEPBX_CLIENT_SECRET`: its client secret, **without** a `Bearer ` prefix.
+
+Allow `gql:core:read` in the application's scopes. `FREEPBX_SCOPE` defaults to
+that scope. `FREEPBX_TOKEN_URL` optionally overrides the token endpoint; by
+default the final path segment of the GraphQL URL is replaced with `token`.
+Use the Token URL shown by your FreePBX API application if it differs.
+
+The service posts form-encoded `grant_type=client_credentials`, `client_id`,
+`client_secret`, and `scope` to the token endpoint on the first extension fetch.
+It keeps the access token in memory and obtains a new one on demand before
+expiry (using `expires_in`). It does not require or store a refresh token.
+Token requests use the same TLS verification and timeout settings as GraphQL.
+Redirects are rejected to avoid forwarding credentials to another endpoint.
+
+Alternatively, set `FREEPBX_API_KEY="Bearer <access-token>"` for a manually
+obtained token. Client credentials take precedence when configured, and both
+client ID and secret are required. If your client secret is currently stored
+in `FREEPBX_API_KEY`, move it to `FREEPBX_CLIENT_SECRET`, remove any `Bearer `
+prefix, and add `FREEPBX_CLIENT_ID`.
+
+Restart the debug session or recreate the container after changing `.env`.
+The app reads process environment variables; it does not load `.env` itself.
+Use the debugger's environment-file support or Compose's `env_file` setting.
 
 `FREEPBX_TLS_VERIFY` defaults to `true`. Set it to `false` to connect to a
 self-signed HTTPS server without certificate or hostname verification. HTTPS
@@ -25,7 +48,7 @@ environment variables for the setting to take effect.
 
 The request is fixed: HTTP `POST`, a JSON body containing the query `query { fetchAllExtensions { status message extension { extensionId user { name } } } }`, and the response path `data.fetchAllExtensions.extension`. Method, body, and response path are not configurable; legacy environment overrides are ignored.
 
-The authentication header is hardcoded to `Authorization`; its name is not configurable and legacy header-name overrides are ignored. The service sends `FREEPBX_API_KEY` verbatim as its value, so include the `Bearer ` prefix. Token acquisition and renewal are not implemented; obtain the token separately using a Machine-to-Machine application with the `gql:core:read` scope.
+The authentication header is hardcoded to `Authorization`; its name is not configurable and legacy header-name overrides are ignored. OAuth tokens are sent with the `Bearer ` prefix automatically; in manual-token mode, `FREEPBX_API_KEY` is sent verbatim. Token endpoint failures return a sanitized error identifying the endpoint without exposing credentials or upstream response bodies. An API HTTP 401 invalidates the cached token for the next fetch; other HTTP errors are not automatically retried.
 
 Each source record must include one of `extension`, `extensionId`, `extension_id`, `number`, or `user_extension`. Names are read from `name`, `display_name`, `displayname`, or `description`, including those fields inside a nested `user` object.
 

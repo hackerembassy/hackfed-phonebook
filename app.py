@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import ssl
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 
 LOGGER = logging.getLogger("phonebook")
@@ -43,25 +45,40 @@ class UpstreamError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     api_url: str
-    api_key: str
+    api_key: str = field(default="", repr=False)
     cache_ttl_seconds: int = 60
     request_timeout_seconds: int = 10
     host: str = "0.0.0.0"
     port: int = 8080
     tls_verify: bool = True
+    client_id: str = ""
+    client_secret: str = field(default="", repr=False)
+    token_url: str = ""
+    scope: str = "gql:core:read"
 
     @classmethod
     def from_env(cls) -> "Config":
         api_url = os.getenv("FREEPBX_API_URL", "").strip()
         api_key = os.getenv("FREEPBX_API_KEY", "").strip()
+        client_id = os.getenv("FREEPBX_CLIENT_ID", "").strip()
+        client_secret = os.getenv("FREEPBX_CLIENT_SECRET", "").strip()
         if not api_url:
             raise ConfigurationError("FREEPBX_API_URL is required")
-        if not api_key:
-            raise ConfigurationError("FREEPBX_API_KEY is required")
+        if client_id or client_secret:
+            if not client_id or not client_secret:
+                raise ConfigurationError("FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET are both required")
+        elif not api_key:
+            raise ConfigurationError(
+                "FREEPBX_CLIENT_ID and FREEPBX_CLIENT_SECRET (or FREEPBX_API_KEY) are required"
+            )
 
         return cls(
             api_url=api_url,
             api_key=api_key,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=os.getenv("FREEPBX_TOKEN_URL", "").strip(),
+            scope=os.getenv("FREEPBX_SCOPE", "gql:core:read").strip(),
             cache_ttl_seconds=_positive_int("CACHE_TTL_SECONDS", 60),
             request_timeout_seconds=_positive_int("REQUEST_TIMEOUT_SECONDS", 10),
             host=os.getenv("HOST", "0.0.0.0").strip(),
@@ -141,9 +158,18 @@ def normalize_extensions(payload: Any) -> list[dict[str, str]]:
     )
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    # Never forward credentials to a redirect destination.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class FreePBXClient:
     def __init__(self, config: Config):
         self.config = config
+        self._token_lock = threading.Lock()
+        self._access_token = ""
+        self._token_expires_at = 0.0
         self._ssl_context = ssl.create_default_context()
         if not config.tls_verify:
             self._ssl_context.check_hostname = False
@@ -152,12 +178,58 @@ class FreePBXClient:
                 "FreePBX TLS certificate verification is disabled; "
                 "the upstream server identity will not be verified"
             )
+        self._opener = build_opener(HTTPSHandler(context=self._ssl_context), _NoRedirect())
+
+    def _authorization(self) -> str:
+        if not self.config.client_id:
+            return self.config.api_key
+        with self._token_lock:
+            now = time.monotonic()
+            if self._access_token and now < self._token_expires_at:
+                return "Bearer " + self._access_token
+
+            parts = urlsplit(self.config.api_url)
+            token_url = self.config.token_url or urlunsplit(
+                (parts.scheme, parts.netloc, parts.path.rsplit("/", 1)[0] + "/token", "", "")
+            )
+            request = Request(
+                token_url,
+                data=urlencode({
+                    "grant_type": "client_credentials",
+                    "client_id": self.config.client_id,
+                    "client_secret": self.config.client_secret,
+                    "scope": self.config.scope,
+                }).encode("utf-8"),
+                headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            payload = self._request_json(request, "token endpoint")
+            if not isinstance(payload, dict):
+                raise UpstreamError("FreePBX token endpoint returned an invalid token response")
+            token = payload.get("access_token")
+            token_type = payload.get("token_type")
+            expires_in = payload.get("expires_in")
+            try:
+                lifetime = float(expires_in)
+            except (TypeError, ValueError, OverflowError):
+                lifetime = 0.0
+            if (
+                not isinstance(token, str) or not token or any(c.isspace() for c in token)
+                or not token.isascii() or not token.isprintable()
+                or not isinstance(token_type, str) or token_type.lower() != "bearer"
+                or isinstance(expires_in, bool) or not math.isfinite(lifetime) or lifetime <= 0
+            ):
+                raise UpstreamError("FreePBX token endpoint returned an invalid token response")
+            self._access_token = token
+            # Start expiry at request time, with a margin even for short-lived tokens.
+            self._token_expires_at = now + lifetime - min(30.0, lifetime * 0.1)
+            return "Bearer " + token
 
     def fetch_extensions(self) -> list[dict[str, str]]:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": self.config.api_key,
+            "Authorization": self._authorization(),
         }
         body = json.dumps({"query": EXTENSIONS_QUERY}).encode("utf-8")
 
@@ -167,21 +239,26 @@ class FreePBXClient:
             headers=headers,
             method="POST",
         )
+        return normalize_extensions(self._request_json(request, "API"))
+
+    def _request_json(self, request: Request, endpoint: str) -> Any:
         try:
-            with urlopen(
+            with self._opener.open(
                 request,
                 timeout=self.config.request_timeout_seconds,
-                context=self._ssl_context,
             ) as response:
-                payload = json.load(response)
+                return json.load(response)
         except HTTPError as error:
-            raise UpstreamError(f"FreePBX API returned HTTP {error.code}") from error
-        except URLError as error:
-            raise UpstreamError(f"could not reach FreePBX API: {error.reason}") from error
+            # Error bodies can echo secrets; never expose them in logs or public responses.
+            error.close()
+            if endpoint == "API" and error.code == 401:
+                with self._token_lock:
+                    self._token_expires_at = 0.0
+            raise UpstreamError(f"FreePBX {endpoint} returned HTTP {error.code}") from None
+        except (URLError, OSError):
+            raise UpstreamError(f"could not reach FreePBX {endpoint}") from None
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise UpstreamError("FreePBX API returned invalid JSON") from error
-
-        return normalize_extensions(payload)
+            raise UpstreamError(f"FreePBX {endpoint} returned invalid JSON") from None
 
 
 class ExtensionCache:
