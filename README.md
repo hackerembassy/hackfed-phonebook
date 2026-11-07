@@ -187,6 +187,21 @@ port. The service always listens on `0.0.0.0:8080` inside the container.
 Running the deployment command again pulls the latest image and recreates the
 container if needed. Stop it with `docker compose -f compose.hosting.yml down`.
 
+## Code structure
+
+`app.py` contains only the `main()` entry point and startup/shutdown handling.
+Application logic is grouped in the `phonebook` package:
+
+- `config.py`: environment configuration and validation.
+- `errors.py`: shared configuration and upstream exceptions.
+- `extensions.py`: FreePBX response validation and extension normalization.
+- `freepbx.py`: OAuth tokens and GraphQL HTTP requests.
+- `cache.py`: thread-safe extension snapshots and stale fallback.
+- `renderers.py`: Yealink and Poly XML formats and device limits.
+- `server.py`: HTTP routes, responses, and server construction.
+
+The installed `freepbx-phonebook` command and `python app.py` remain unchanged.
+
 ## Test
 
 ```bash

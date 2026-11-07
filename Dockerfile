@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY app.py ./app.py
+COPY phonebook/ ./phonebook/
 
 RUN useradd --create-home --uid 10001 phonebook
 USER phonebook

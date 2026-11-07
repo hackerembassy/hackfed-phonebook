@@ -11,7 +11,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 from urllib.request import urlopen
 
-from app import ConfigurationError, Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions, render_c60_phonebook, render_yealink_phonebook
+from phonebook.cache import ExtensionCache
+from phonebook.config import Config
+from phonebook.errors import ConfigurationError, UpstreamError
+from phonebook.extensions import normalize_extensions
+from phonebook.freepbx import FreePBXClient
+from phonebook.renderers import render_c60_phonebook, render_yealink_phonebook
+from phonebook.server import create_server
 
 
 def graphql_payload(records, status=True):
@@ -31,6 +37,20 @@ class TLSConfigurationTests(unittest.TestCase):
     def test_verification_enabled_by_default(self):
         self.assertTrue(self.config_from_env().tls_verify)
 
+    def test_environment_defaults_match_dataclass_defaults(self):
+        config = self.config_from_env()
+        self.assertEqual(config, Config(
+            api_url=config.api_url,
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+        ))
+
+    def test_log_level_defaults_to_info(self):
+        self.assertEqual(self.config_from_env().log_level, "INFO")
+
+    def test_log_level_is_read_and_uppercased(self):
+        self.assertEqual(self.config_from_env(LOG_LEVEL="debug").log_level, "DEBUG")
+
     def test_boolean_values(self):
         for raw in ("true", " TRUE "):
             with self.subTest(raw=raw):
@@ -41,7 +61,7 @@ class TLSConfigurationTests(unittest.TestCase):
 
     def test_client_passes_scoped_tls_context(self):
         for verify in (True, False):
-            with self.subTest(verify=verify), patch("app.build_opener") as build:
+            with self.subTest(verify=verify), patch("phonebook.freepbx.build_opener") as build:
                 open_url = build.return_value.open
                 config = self.config_from_env(FREEPBX_TLS_VERIFY=str(verify))
                 client = FreePBXClient(config)
@@ -93,7 +113,6 @@ class OAuthTests(unittest.TestCase):
             config = Config.from_env()
         self.assertEqual(config.client_id, "test-client")
         self.assertEqual(config.client_secret, "test-secret")
-        self.assertEqual(config.scope, "gql:core:read")
         self.assertNotIn("test-secret", repr(config))
         for missing in ("FREEPBX_CLIENT_ID", "FREEPBX_CLIENT_SECRET"):
             incomplete = {k: v for k, v in env.items() if k != missing}
@@ -111,7 +130,7 @@ class OAuthTests(unittest.TestCase):
 
     def test_token_request_reuse_and_early_renewal(self):
         client = FreePBXClient(self.config)
-        with patch.object(client._opener, "open") as open_url, patch("app.time.monotonic", return_value=100) as clock:
+        with patch.object(client._opener, "open") as open_url, patch("phonebook.freepbx.time.monotonic", return_value=100) as clock:
             open_url.side_effect = [
                 self.response(self.token()), self.response(graphql_payload([])),
                 self.response(graphql_payload([])),
@@ -342,9 +361,9 @@ class C60PhonebookTests(unittest.TestCase):
         record = {"name": "&" * 40, "extension": "&" * 128}
         one = render_c60_phonebook([record])
         records = [record, {"name": "Second", "extension": "102"}]
-        with patch("app.POLY_C60_MAX_BYTES", len(one)), self.assertLogs("phonebook", level="WARNING"):
+        with patch("phonebook.renderers.POLY_C60_MAX_BYTES", len(one)), self.assertLogs("phonebook", level="WARNING"):
             self.assertEqual(render_c60_phonebook(records), one)
-        with patch("app.POLY_C60_MAX_BYTES", len(one) - 1), self.assertLogs("phonebook", level="WARNING"):
+        with patch("phonebook.renderers.POLY_C60_MAX_BYTES", len(one) - 1), self.assertLogs("phonebook", level="WARNING"):
             self.assertEqual(render_c60_phonebook(records), render_c60_phonebook([]))
 
 
@@ -493,7 +512,7 @@ class ApiIntegrationTests(unittest.TestCase):
     def test_xml_endpoint_serves_stale_contacts_on_failure(self):
         with patch.object(self.fetch_extensions, "side_effect", [
             [{"extension": "101", "name": "Bob"}], UpstreamError("temporary failure"),
-        ]), patch("app.time.monotonic", side_effect=[0, 61]):
+        ]), patch("phonebook.cache.time.monotonic", side_effect=[0, 61]):
             url = f"http://127.0.0.1:{self.service.server_port}/yealink.xml"
             with urlopen(url) as response:
                 first = response.read()
@@ -523,7 +542,7 @@ class ApiIntegrationTests(unittest.TestCase):
         base_url = f"http://127.0.0.1:{self.service.server_port}"
         with patch.object(self.fetch_extensions, "side_effect", [
             [{"extension": "101", "name": "Bob"}], UpstreamError("temporary failure"),
-        ]), patch("app.time.monotonic", side_effect=[0, 61]):
+        ]), patch("phonebook.cache.time.monotonic", side_effect=[0, 61]):
             with urlopen(base_url + "/poly/000000000000-directory.xml") as response:
                 first = response.read()
             with urlopen(base_url + "/poly/000000000000-directory.xml") as response:
