@@ -33,6 +33,8 @@ query {
 EXTENSIONS_PATH = "data.fetchAllExtensions.extension"
 EXTENSION_KEYS = ("extension", "extensionId", "extension_id", "number", "user_extension")
 NAME_KEYS = ("name", "display_name", "displayname", "description")
+POLY_C60_MAX_CONTACTS = 500
+POLY_C60_MAX_BYTES = 4 * 1024 * 1024
 
 
 class ConfigurationError(ValueError):
@@ -314,22 +316,66 @@ def render_yealink_phonebook(extensions: list[dict[str, str]]) -> bytes:
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+def _poly_name(value: str) -> str:
+    # Limit encoded bytes without cutting a multi-byte UTF-8 character.
+    return _xml_text(value).encode("utf-8")[:40].decode("utf-8", errors="ignore")
+
+
+def render_c60_phonebook(extensions: list[dict[str, str]]) -> bytes:
+    root = ET.Element("directory")
+    items = ET.SubElement(root, "item_list")
+    size = len(ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=False))
+    contacts: set[str] = set()
+    for extension in extensions:
+        contact = extension["extension"].strip()
+        # Never truncate or repair a dial string into a different destination.
+        if (
+            not contact or len(contact) > 128 or _xml_text(contact) != contact
+            or contact in contacts
+        ):
+            continue
+        name = _xml_text(extension["name"]).strip() or contact
+        parts = name.split(maxsplit=1)
+        entry = ET.Element("item")
+        for tag, value in (
+            ("fn", _poly_name(parts[0])),
+            ("ln", _poly_name(parts[1]) if len(parts) > 1 else ""),
+            ("ct", contact),
+            ("lb", _poly_name(name)),
+        ):
+            ET.SubElement(entry, tag).text = value
+        entry_size = len(ET.tostring(entry, encoding="utf-8", short_empty_elements=False))
+        if len(items) >= POLY_C60_MAX_CONTACTS or size + entry_size > POLY_C60_MAX_BYTES:
+            break
+        items.append(entry)
+        contacts.add(contact)
+        size += entry_size
+    if len(items) < len(extensions):
+        LOGGER.warning("C60 directory omitted %d contacts due to invalid/duplicate dial strings or device limits", len(extensions) - len(items))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=False)
+
+
 def make_handler(cache: ExtensionCache) -> type[BaseHTTPRequestHandler]:
+    xml_renderers = {
+        "/yealink.xml": render_yealink_phonebook,
+        "/poly/000000000000-directory.xml": render_c60_phonebook,
+    }
+
     class PhonebookHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path in ("/extensions", "/yealink.xml"):
-                is_xml = self.path == "/yealink.xml"
+            if self.path == "/extensions" or self.path in xml_renderers:
+                renderer = xml_renderers.get(self.path)
                 try:
                     snapshot = cache.get()
-                    if is_xml:
-                        self._send_body(200, render_yealink_phonebook(snapshot["extensions"]), "text/xml; charset=utf-8")
+                    if renderer is not None:
+                        self._send_body(200, renderer(snapshot["extensions"]), "text/xml; charset=utf-8")
                     else:
                         self._send_json(200, snapshot)
                 except (ConfigurationError, UpstreamError) as error:
                     LOGGER.error("Unable to load phonebook: %s", error)
-                    if is_xml:
+                    if renderer is not None:
                         # Signal failure rather than replace contacts with a fake error contact.
-                        self._send_body(502, render_yealink_phonebook([]), "text/xml; charset=utf-8")
+                        self._send_body(502, renderer([]), "text/xml; charset=utf-8")
                     else:
                         self._send_json(502, {"error": str(error)})
             elif self.path == "/health":

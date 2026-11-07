@@ -1,6 +1,6 @@
 # FreePBX Phonebook
 
-A minimal, read-only HTTP service that retrieves extensions from a FreePBX 17 API endpoint and exposes them as normalized JSON and a Yealink XML remote phonebook. It runs with Podman, has no database, and has no Python dependencies outside the standard library.
+A minimal, read-only HTTP service that retrieves extensions from a FreePBX 17 API endpoint and exposes them as normalized JSON, a Yealink XML remote phonebook, and a Poly Trio C60 XML directory. It runs with Podman, has no database, and has no Python dependencies outside the standard library.
 
 ## Configure
 
@@ -107,6 +107,52 @@ or redirects. If older W52 firmware cannot negotiate your HTTPS/TLS setup, use
 an HTTP URL on a trusted LAN or update the firmware; do not expose an unsecured
 phonebook publicly. The phone caches its downloaded directory independently of
 this service, so use its manual update or scheduled refresh to see changes.
+
+## Poly Trio C60 contact directory
+
+`GET /poly/000000000000-directory.xml` returns a Poly UC
+Software directory: `directory > item_list > item`. Each item contains `fn`
+(first name), `ln` (remaining name), `ct` (dial string), and `lb` (full-name label).
+Names and labels are limited to 40 UTF-8 bytes without splitting characters;
+invalid XML characters in names are removed and XML syntax is escaped.
+Empty names fall back to the dial string. Optional speed-dial, ringtone,
+presence, diversion, and line-binding fields are omitted to retain phone defaults.
+
+The first 500 eligible contacts in the existing extension order are included,
+within a 4 MiB serialized XML limit. Blank dial strings, those over 128 characters,
+those containing invalid XML characters, and duplicates are skipped (first wins).
+Dial strings are not truncated or repaired; leading zeros and SIP URIs are
+preserved. Omitted-contact counts are logged. JSON and Yealink output remain
+unrestricted by these C60 limits.
+
+The endpoint shares the JSON/Yealink cache and returns `text/xml; charset=utf-8`, an
+XML declaration, and no BOM. Refresh failures serve the last snapshot with
+HTTP 200; initial failures return HTTP 502 with an empty Poly directory.
+
+For provisioning:
+
+1. Route `000000000000-directory.xml` on the phone's existing provisioning
+  server to this service's `/poly/000000000000-directory.xml` endpoint,
+  without redirects or browser logins. For example:
+  `https://phonebook.hackem.cc/poly/000000000000-directory.xml`.
+  If provisioning directly from this namespace, use
+  `https://phonebook.hackem.cc/poly/` as the provisioning base URL so the phone
+  appends the required filename. Other configuration/firmware files must also
+  be routed there by your provisioning server; this service does not supply them.
+  The root `/000000000000-directory.xml` is not served, leaving that namespace
+  available for other vendors/providers.
+2. In the phone's provisioned configuration, set `feature.directory.enabled="1"`
+  and `dir.local.readonly="1"`. Local directory support may be disabled in
+  Teams/Skype base profiles; check the phone's firmware/profile support.
+3. Reboot or trigger a directory provisioning sync. Where supported, set
+  `voIpProt.SIP.specialEvent.checkSync.downloadDirectory="1"` for check-sync
+  directory updates. The phone's download cycle is separate from the service TTL.
+
+Device-specific `<mac>-directory.xml` requests intentionally return 404: this
+service supplies only the global directory and does not accept contact uploads
+or serve other provisioning files. Keep existing device provisioning on its
+current server; remove conflicting personal contacts there if they override
+global entries. Use trusted network access and a certificate the phone accepts.
 
 ## Container image
 

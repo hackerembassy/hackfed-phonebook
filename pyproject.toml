@@ -1,7 +1,7 @@
 [project]
 name = "freepbx-phonebook"
 version = "0.1.0"
-description = "Minimal JSON and Yealink XML phonebook backed by the FreePBX API"
+description = "Minimal phonebook provider backed by the FreePBX API"
 requires-python = ">=3.11"
 dependencies = []
 

@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 from urllib.request import urlopen
 
-from app import ConfigurationError, Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions, render_yealink_phonebook
+from app import ConfigurationError, Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions, render_c60_phonebook, render_yealink_phonebook
 
 
 def graphql_payload(records, status=True):
@@ -264,6 +264,90 @@ class YealinkPhonebookTests(unittest.TestCase):
         self.assertEqual(entry.findtext("Telephone"), "102")
 
 
+class C60PhonebookTests(unittest.TestCase):
+    def test_schema_utf8_and_escaping(self):
+        records = [
+            {"name": 'Álice & <Team> "Support"', "extension": "00101"},
+            {"name": "Helpdesk", "extension": "sip:301@example.test?a=1&b=2"},
+        ]
+        body = render_c60_phonebook(records)
+        self.assertTrue(body.startswith(b"<?xml"))
+        self.assertFalse(body.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"&amp;", body)
+        self.assertIn(b"&lt;Team&gt;", body)
+        root = ET.fromstring(body)
+        self.assertEqual(root.tag, "directory")
+        self.assertEqual([child.tag for child in root], ["item_list"])
+        entries = root.find("item_list")
+        self.assertEqual(len(entries), 2)
+        for entry, record in zip(entries, records):
+            self.assertEqual(entry.tag, "item")
+            self.assertEqual([child.tag for child in entry], ["fn", "ln", "ct", "lb"])
+            self.assertEqual(entry.findtext("ct"), record["extension"])
+            self.assertEqual(entry.findtext("lb"), record["name"])
+        self.assertEqual(entries[0].findtext("fn"), "Álice")
+        self.assertEqual(entries[0].findtext("ln"), '& <Team> "Support"')
+        self.assertEqual(entries[1].findtext("ln"), "")
+
+    def test_empty_directory(self):
+        root = ET.fromstring(render_c60_phonebook([]))
+        self.assertEqual(root.tag, "directory")
+        self.assertEqual(len(root.find("item_list")), 0)
+
+    def test_name_byte_limits_and_invalid_xml_characters(self):
+        body = render_c60_phonebook([
+            {"name": "A\x00\x01\ud800\ufffe" + "é" * 30 + " " + "😀" * 20, "extension": "102"},
+        ])
+        entry = ET.fromstring(body).find("item_list/item")
+        self.assertEqual(entry.findtext("fn"), "A" + "é" * 19)
+        self.assertEqual(entry.findtext("ln"), "😀" * 10)
+        self.assertEqual(entry.findtext("lb"), "A" + "é" * 19)
+        for tag in ("fn", "ln", "lb"):
+            self.assertLessEqual(len(entry.findtext(tag).encode("utf-8")), 40)
+
+    def test_blank_name_falls_back_to_contact(self):
+        entry = ET.fromstring(render_c60_phonebook([
+            {"name": " \x00 ", "extension": "00102"},
+        ])).find("item_list/item")
+        self.assertEqual(entry.findtext("fn"), "00102")
+        self.assertEqual(entry.findtext("lb"), "00102")
+
+    def test_invalid_and_duplicate_contacts_are_skipped_without_repair(self):
+        records = [
+            {"name": "Skip", "extension": value}
+            for value in ("", "  ", "10\x002", "x" * 129)
+        ] + [
+            {"name": "First", "extension": "00102"},
+            {"name": "Duplicate", "extension": "00102"},
+            {"name": "Maximum", "extension": "é" * 128},
+        ]
+        with self.assertLogs("phonebook", level="WARNING") as logs:
+            entries = ET.fromstring(render_c60_phonebook(records)).find("item_list")
+        self.assertEqual([entry.findtext("ct") for entry in entries], ["00102", "é" * 128])
+        self.assertEqual(entries[0].findtext("fn"), "First")
+        self.assertIn("omitted 5 contacts", logs.output[0])
+
+    def test_contact_limit_does_not_modify_other_outputs(self):
+        records = [{"name": f"Contact {i}", "extension": str(i)} for i in range(501)]
+        with self.assertLogs("phonebook", level="WARNING"):
+            body = render_c60_phonebook(records)
+        entries = ET.fromstring(body).find("item_list")
+        self.assertEqual(len(entries), 500)
+        self.assertEqual(entries[-1].findtext("ct"), "499")
+        self.assertLessEqual(len(body), 4 * 1024 * 1024)
+        self.assertEqual(len(records), 501)
+        self.assertEqual(len(ET.fromstring(render_yealink_phonebook(records))), 501)
+
+    def test_serialized_size_limit_includes_escaping_and_wrapper(self):
+        record = {"name": "&" * 40, "extension": "&" * 128}
+        one = render_c60_phonebook([record])
+        records = [record, {"name": "Second", "extension": "102"}]
+        with patch("app.POLY_C60_MAX_BYTES", len(one)), self.assertLogs("phonebook", level="WARNING"):
+            self.assertEqual(render_c60_phonebook(records), one)
+        with patch("app.POLY_C60_MAX_BYTES", len(one) - 1), self.assertLogs("phonebook", level="WARNING"):
+            self.assertEqual(render_c60_phonebook(records), render_c60_phonebook([]))
+
+
 class ExtensionCacheTests(unittest.TestCase):
     def test_serves_last_snapshot_when_refresh_fails(self):
         calls = 0
@@ -417,6 +501,67 @@ class ApiIntegrationTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.read(), first)
             self.assertEqual(self.fetch_extensions.call_count, 2)
+
+    def test_c60_endpoint_shares_cache_with_json_and_yealink(self):
+        base_url = f"http://127.0.0.1:{self.service.server_port}"
+        with urlopen(base_url + "/extensions") as response:
+            snapshot = json.load(response)
+        with urlopen(base_url + "/poly/000000000000-directory.xml") as response:
+            body = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "text/xml; charset=utf-8")
+            self.assertEqual(int(response.headers["Content-Length"]), len(body))
+            entry = ET.fromstring(body).find("item_list/item")
+            self.assertEqual(entry.findtext("lb"), snapshot["extensions"][0]["name"])
+            self.assertEqual(entry.findtext("ct"), "101")
+        with urlopen(base_url + "/yealink.xml") as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(self.fetch_extensions.call_count, 1)
+        self.assertEqual(len(self.token_requests), 1)
+
+    def test_c60_endpoint_serves_stale_contacts(self):
+        base_url = f"http://127.0.0.1:{self.service.server_port}"
+        with patch.object(self.fetch_extensions, "side_effect", [
+            [{"extension": "101", "name": "Bob"}], UpstreamError("temporary failure"),
+        ]), patch("app.time.monotonic", side_effect=[0, 61]):
+            with urlopen(base_url + "/poly/000000000000-directory.xml") as response:
+                first = response.read()
+            with urlopen(base_url + "/poly/000000000000-directory.xml") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), first)
+            self.assertEqual(self.fetch_extensions.call_count, 2)
+
+    def test_c60_endpoint_initial_failure(self):
+        with patch.object(self.fetch_extensions, "side_effect", UpstreamError("temporary failure")):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(f"http://127.0.0.1:{self.service.server_port}/poly/000000000000-directory.xml")
+            with caught.exception as response:
+                self.assertEqual(response.code, 502)
+                self.assertEqual(response.headers["Content-Type"], "text/xml; charset=utf-8")
+                root = ET.fromstring(response.read())
+                self.assertEqual(root.tag, "directory")
+                self.assertEqual(len(root.find("item_list")), 0)
+
+    def test_removed_c60_alias_is_not_served(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.service.server_port}/c60.xml")
+        with caught.exception as response:
+            self.assertEqual(response.code, 404)
+        self.assertEqual(self.fetch_extensions.call_count, 0)
+
+    def test_c60_personal_directory_is_not_served(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.service.server_port}/poly/64167ff599d0-directory.xml")
+        with caught.exception as response:
+            self.assertEqual(response.code, 404)
+        self.assertEqual(self.fetch_extensions.call_count, 0)
+
+    def test_root_global_directory_is_reserved_for_other_providers(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.service.server_port}/000000000000-directory.xml")
+        with caught.exception as response:
+            self.assertEqual(response.code, 404)
+        self.assertEqual(self.fetch_extensions.call_count, 0)
 
     def test_xml_endpoint_initial_failure(self):
         with patch.object(self.fetch_extensions, "side_effect", UpstreamError("temporary failure")):
