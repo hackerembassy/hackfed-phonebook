@@ -4,13 +4,14 @@ import os
 import ssl
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 from urllib.request import urlopen
 
-from app import ConfigurationError, Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions
+from app import ConfigurationError, Config, ExtensionCache, FreePBXClient, UpstreamError, create_server, normalize_extensions, render_yealink_phonebook
 
 
 def graphql_payload(records, status=True):
@@ -87,14 +88,11 @@ class OAuthTests(unittest.TestCase):
             "FREEPBX_API_URL": self.config.api_url,
             "FREEPBX_CLIENT_ID": "test-client",
             "FREEPBX_CLIENT_SECRET": "test-secret",
-            "FREEPBX_TOKEN_URL": "https://pbx.example.test/oauth/token",
-            "FREEPBX_SCOPE": "gql:core:read",
         }
         with patch.dict(os.environ, env, clear=True):
             config = Config.from_env()
         self.assertEqual(config.client_id, "test-client")
         self.assertEqual(config.client_secret, "test-secret")
-        self.assertEqual(config.token_url, env["FREEPBX_TOKEN_URL"])
         self.assertEqual(config.scope, "gql:core:read")
         self.assertNotIn("test-secret", repr(config))
         for missing in ("FREEPBX_CLIENT_ID", "FREEPBX_CLIENT_SECRET"):
@@ -138,13 +136,6 @@ class OAuthTests(unittest.TestCase):
             self.assertEqual(calls[1].args[0].get_header("Authorization"), "Bearer test-access-token")
             self.assertEqual(calls[4].args[0].get_header("Authorization"), "Bearer replacement")
             self.assertEqual(calls[0].kwargs["timeout"], self.config.request_timeout_seconds)
-
-    def test_explicit_token_url(self):
-        config = Config(**{**vars(self.config), "token_url": "https://pbx.example.test/oauth/token"})
-        client = FreePBXClient(config)
-        with patch.object(client._opener, "open", return_value=self.response(self.token())) as open_url:
-            self.assertEqual(client._authorization(), "Bearer test-access-token")
-            self.assertEqual(open_url.call_args.args[0].full_url, config.token_url)
 
     def test_invalid_token_responses(self):
         payloads = [None, [], {}, {"error": "invalid_client"}]
@@ -238,6 +229,41 @@ class NormalizeExtensionsTests(unittest.TestCase):
                 normalize_extensions(payload)
 
 
+class YealinkPhonebookTests(unittest.TestCase):
+    def test_schema_utf8_and_escaping(self):
+        records = [
+            {"name": 'Álice & <Team> "Support"', "extension": "00101"},
+            {"name": "IP phone", "extension": "302@192.168.2.121"},
+            {"name": "SIP phone", "extension": "sip:301@example.test?a=1&b=2"},
+        ]
+        body = render_yealink_phonebook(records)
+        self.assertTrue(body.startswith(b"<?xml"))
+        self.assertFalse(body.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"&amp;", body)
+        self.assertIn(b"&lt;Team&gt;", body)
+        root = ET.fromstring(body)
+        self.assertEqual(root.tag, "YealinkIPPhoneDirectory")
+        self.assertEqual(len(root), len(records))
+        for entry, record in zip(root, records):
+            self.assertEqual(entry.tag, "DirectoryEntry")
+            self.assertEqual([child.tag for child in entry], ["Name", "Telephone"])
+            self.assertEqual(entry.findtext("Name"), record["name"])
+            self.assertEqual(entry.findtext("Telephone"), record["extension"])
+
+    def test_empty_directory(self):
+        root = ET.fromstring(render_yealink_phonebook([]))
+        self.assertEqual(root.tag, "YealinkIPPhoneDirectory")
+        self.assertEqual(len(root), 0)
+
+    def test_invalid_xml_characters_and_name_limit(self):
+        body = render_yealink_phonebook([
+            {"name": "A\x00\x01\ud800\ufffe" + "é" * 110, "extension": "10\x002"},
+        ])
+        entry = ET.fromstring(body)[0]
+        self.assertEqual(entry.findtext("Name"), "A" + "é" * 98)
+        self.assertEqual(entry.findtext("Telephone"), "102")
+
+
 class ExtensionCacheTests(unittest.TestCase):
     def test_serves_last_snapshot_when_refresh_fails(self):
         calls = 0
@@ -328,7 +354,10 @@ class ApiIntegrationTests(unittest.TestCase):
             self.assertFalse(hasattr(config, field))
         # A zero port selects an ephemeral port for the test server.
         config = Config(**{**vars(config), "port": 0})
-        self.service = create_server(config, FreePBXClient(config))
+        client = FreePBXClient(config)
+        self.fetch_extensions = MagicMock(wraps=client.fetch_extensions)
+        client.fetch_extensions = self.fetch_extensions
+        self.service = create_server(config, client)
         self.service_thread = threading.Thread(target=self.service.serve_forever)
         self.service_thread.start()
 
@@ -361,6 +390,44 @@ class ApiIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(payload["stale"])
         self.assertIsNotNone(payload["updated_at"])
+
+    def test_xml_endpoint_shares_json_cache(self):
+        base_url = f"http://127.0.0.1:{self.service.server_port}"
+        with urlopen(base_url + "/extensions") as response:
+            snapshot = json.load(response)
+        with urlopen(base_url + "/yealink.xml") as response:
+            body = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "text/xml; charset=utf-8")
+            self.assertEqual(int(response.headers["Content-Length"]), len(body))
+        entry = ET.fromstring(body)[0]
+        self.assertEqual(entry.findtext("Name"), snapshot["extensions"][0]["name"])
+        self.assertEqual(entry.findtext("Telephone"), "101")
+        self.assertEqual(len(self.token_requests), 1)
+        self.assertEqual(self.fetch_extensions.call_count, 1)
+
+    def test_xml_endpoint_serves_stale_contacts_on_failure(self):
+        with patch.object(self.fetch_extensions, "side_effect", [
+            [{"extension": "101", "name": "Bob"}], UpstreamError("temporary failure"),
+        ]), patch("app.time.monotonic", side_effect=[0, 61]):
+            url = f"http://127.0.0.1:{self.service.server_port}/yealink.xml"
+            with urlopen(url) as response:
+                first = response.read()
+            with urlopen(url) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), first)
+            self.assertEqual(self.fetch_extensions.call_count, 2)
+
+    def test_xml_endpoint_initial_failure(self):
+        with patch.object(self.fetch_extensions, "side_effect", UpstreamError("temporary failure")):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(f"http://127.0.0.1:{self.service.server_port}/yealink.xml")
+        with caught.exception as response:
+            self.assertEqual(response.code, 502)
+            self.assertEqual(response.headers["Content-Type"], "text/xml; charset=utf-8")
+            root = ET.fromstring(response.read())
+            self.assertEqual(root.tag, "YealinkIPPhoneDirectory")
+            self.assertEqual(len(root), 0)
 
     def test_oauth_flow_over_http(self):
         client = FreePBXClient(Config(

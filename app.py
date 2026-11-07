@@ -7,6 +7,7 @@ import os
 import ssl
 import threading
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,7 +53,6 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 8080
     tls_verify: bool = True
-    token_url: str = ""
     scope: str = "gql:core:read"
 
     @classmethod
@@ -69,8 +69,7 @@ class Config:
             api_url=api_url,
             client_id=client_id,
             client_secret=client_secret,
-            token_url=os.getenv("FREEPBX_TOKEN_URL", "").strip(),
-            scope=os.getenv("FREEPBX_SCOPE", "gql:core:read").strip(),
+            scope="gql:core:read",
             cache_ttl_seconds=_positive_int("CACHE_TTL_SECONDS", 60),
             request_timeout_seconds=_positive_int("REQUEST_TIMEOUT_SECONDS", 10),
             host=os.getenv("HOST", "0.0.0.0").strip(),
@@ -179,7 +178,7 @@ class FreePBXClient:
                 return "Bearer " + self._access_token
 
             parts = urlsplit(self.config.api_url)
-            token_url = self.config.token_url or urlunsplit(
+            token_url = urlunsplit(
                 (parts.scheme, parts.netloc, parts.path.rsplit("/", 1)[0] + "/token", "", "")
             )
             request = Request(
@@ -297,15 +296,42 @@ class ExtensionCache:
         }
 
 
+def _xml_text(value: str) -> str:
+    # XML 1.0 forbids control characters and surrogate code points.
+    return "".join(
+        char for char in value
+        if char in "\t\n\r" or "\u0020" <= char <= "\ud7ff"
+        or "\ue000" <= char <= "\ufffd" or "\U00010000" <= char <= "\U0010ffff"
+    )
+
+
+def render_yealink_phonebook(extensions: list[dict[str, str]]) -> bytes:
+    root = ET.Element("YealinkIPPhoneDirectory")
+    for extension in extensions:
+        entry = ET.SubElement(root, "DirectoryEntry")
+        ET.SubElement(entry, "Name").text = _xml_text(extension["name"])[:99]
+        ET.SubElement(entry, "Telephone").text = _xml_text(extension["extension"])
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 def make_handler(cache: ExtensionCache) -> type[BaseHTTPRequestHandler]:
     class PhonebookHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/extensions":
+            if self.path in ("/extensions", "/yealink.xml"):
+                is_xml = self.path == "/yealink.xml"
                 try:
-                    self._send_json(200, cache.get())
+                    snapshot = cache.get()
+                    if is_xml:
+                        self._send_body(200, render_yealink_phonebook(snapshot["extensions"]), "text/xml; charset=utf-8")
+                    else:
+                        self._send_json(200, snapshot)
                 except (ConfigurationError, UpstreamError) as error:
                     LOGGER.error("Unable to load phonebook: %s", error)
-                    self._send_json(502, {"error": str(error)})
+                    if is_xml:
+                        # Signal failure rather than replace contacts with a fake error contact.
+                        self._send_body(502, render_yealink_phonebook([]), "text/xml; charset=utf-8")
+                    else:
+                        self._send_json(502, {"error": str(error)})
             elif self.path == "/health":
                 self._send_json(200, cache.status())
             else:
@@ -313,8 +339,11 @@ def make_handler(cache: ExtensionCache) -> type[BaseHTTPRequestHandler]:
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self._send_body(status, body, "application/json; charset=utf-8")
+
+        def _send_body(self, status: int, body: bytes, content_type: str) -> None:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

@@ -1,6 +1,6 @@
-# FreePBX JSON Phonebook
+# FreePBX Phonebook
 
-A minimal, read-only HTTP service that retrieves extensions from a FreePBX 17 API endpoint and exposes them as normalized JSON. It runs with Podman, has no database, and has no Python dependencies outside the standard library.
+A minimal, read-only HTTP service that retrieves extensions from a FreePBX 17 API endpoint and exposes them as normalized JSON and a Yealink XML remote phonebook. It runs with Podman, has no database, and has no Python dependencies outside the standard library.
 
 ## Configure
 
@@ -16,10 +16,7 @@ Set these required values in `.env`:
 - `FREEPBX_CLIENT_ID`: the Machine-to-Machine application's client ID.
 - `FREEPBX_CLIENT_SECRET`: its client secret.
 
-Allow `gql:core:read` in the application's scopes. `FREEPBX_SCOPE` defaults to
-that scope. `FREEPBX_TOKEN_URL` optionally overrides the token endpoint; by
-default the final path segment of the GraphQL URL is replaced with `token`.
-Use the Token URL shown by your FreePBX API application if it differs.
+Allow `gql:core:read` in the application's scopes.
 
 The service posts form-encoded `grant_type=client_credentials`, `client_id`,
 `client_secret`, and `scope` to the token endpoint on the first extension fetch.
@@ -78,6 +75,38 @@ Example response:
 `GET /extensions` refreshes from FreePBX after `CACHE_TTL_SECONDS`, which defaults to 60 seconds. If a refresh fails after at least one successful request, the last snapshot is returned with `"stale": true`. Before the first successful fetch, an upstream failure returns HTTP 502.
 
 `GET /health` reports whether a snapshot exists and whether the last refresh failed. It does not call FreePBX.
+
+## Yealink W52 remote phonebook
+
+`GET /yealink.xml` returns a flat `YealinkIPPhoneDirectory` with one
+`DirectoryEntry` per extension, containing `Name` and `Telephone`. It uses
+`text/xml; charset=utf-8`, includes an XML declaration, and has no UTF-8 BOM.
+Names are XML-escaped and limited to 99 characters; invalid XML 1.0 characters
+are removed. Dial strings remain strings, preserving leading zeros and SIP URLs.
+
+The XML and JSON endpoints share the same FreePBX client and cache. No separate
+request to the public `/extensions` endpoint is needed. On a refresh failure,
+the XML endpoint returns the last successful directory with HTTP 200. If no
+snapshot exists yet, it returns HTTP 502 with an empty XML directory, not a
+fake dialable error contact.
+
+After deploying this version and routing `/yealink.xml` through your reverse
+proxy, configure the **W52 base station's web interface**:
+
+1. Open **Directory > Remote Phone Book**.
+2. Set **Phone Book URL** to `https://phonebook.hackem.cc/yealink.xml`.
+3. Set **Phone Book Name** to `Extensions` and save.
+4. On the handset, open **Menu > Directory > Remote Phone Book** and select
+  **Extensions**. Menu labels can vary by firmware.
+
+For auto-provisioning, set `remote_phonebook.data.1.url` to that URL and
+`remote_phonebook.data.1.name` to `Extensions`.
+
+The base station must be able to reach the URL directly without a browser login
+or redirects. If older W52 firmware cannot negotiate your HTTPS/TLS setup, use
+an HTTP URL on a trusted LAN or update the firmware; do not expose an unsecured
+phonebook publicly. The phone caches its downloaded directory independently of
+this service, so use its manual update or scheduled refresh to see changes.
 
 ## Container image
 
