@@ -81,7 +81,7 @@ class FreePBXClient:
             token_type = payload.get("token_type")
             expires_in = payload.get("expires_in")
             try:
-                lifetime = float(expires_in)
+                lifetime = float(expires_in) if isinstance(expires_in, (str, int, float)) else 0.0
             except (TypeError, ValueError, OverflowError):
                 lifetime = 0.0
             if (
